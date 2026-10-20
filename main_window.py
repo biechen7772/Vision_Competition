@@ -3,6 +3,8 @@ from tkinter import ttk, messagebox
 from logger import Logger
 from image_processor import ImageProcessor
 from tcp_communication import TCPCommunication
+from ui_dispatcher import UIDispatcher
+import threading
 
 class MainWindow:
     def __init__(self, root):
@@ -15,19 +17,29 @@ class MainWindow:
         self.create_widgets()
         
         # 初始化日志系统
-        self.logger = Logger(self.log_text)
+        self.ui_dispatcher = UIDispatcher(self.root)
+        self.logger = Logger(self.log_text, self.ui_dispatcher)
+        self.service_busy = False
+        self.closing = False
         
         # 初始化图像处理器
         self.image_processor = ImageProcessor(self.image_label, self.image_info, self.logger)
         
         # 初始化TCP通信
-        self.tcp_communication = TCPCommunication(self.logger, self.image_processor)
+        # TCP handler runs in worker threads; marshal image widget updates to
+        # Tkinter's main loop instead of touching widgets from those threads.
+        self.tcp_communication = TCPCommunication(
+            self.logger,
+            self.image_processor,
+            ui_dispatcher=self.ui_dispatcher,
+        )
         
         # 添加启动日志
         self.logger.log("程序已启动")
         self.logger.log("请配置服务器和客户端参数，然后点击'启动服务'按钮")
          # 在初始化完成后自动启动服务
-        self.start_server()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_window)
+        self.root.after(0, self.start_server)
     
  
     
@@ -133,27 +145,59 @@ class MainWindow:
     
     def start_server(self):
         """启动服务器"""
+        if self.service_busy or self.closing:
+            return
+        try:
+            settings = (self.plc_host.get(), self.plc_port.get(), self.virtual_host.get(),
+                        self.virtual_port.get(), self.socket_timeout.get())
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror("错误", f"通信配置无效：{exc}")
+            return
         # 设置TCP通信配置
         self.tcp_communication.set_config(
-            self.plc_host.get(),
-            self.plc_port.get(),
-            self.virtual_host.get(),
-            self.virtual_port.get(),
-            self.socket_timeout.get()
+            *settings
         )
         
-        # 启动服务器
-        if self.tcp_communication.start_server():
+        self.service_busy = True
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED)
+        threading.Thread(target=self._start_service, daemon=True, name="service-start").start()
+
+    def _start_service(self):
+        success = self.tcp_communication.start_server()
+        self.ui_dispatcher(self._service_started, success)
+
+    def _service_started(self, success):
+        self.service_busy = False
+        if success:
             self.start_button.config(state=tk.DISABLED)
             self.stop_button.config(state=tk.NORMAL)
         else:
+            self.start_button.config(state=tk.NORMAL)
             messagebox.showerror("错误", "无法启动服务器，请检查配置和网络连接")
     
     def stop_server(self):
         """停止服务器"""
+        if self.service_busy or self.closing:
+            return
+        self.service_busy = True
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED)
+        threading.Thread(target=self._stop_service, daemon=True, name="service-stop").start()
+
+    def _stop_service(self):
         self.tcp_communication.stop_server()
+        self.ui_dispatcher(self._service_stopped)
+
+    def _service_stopped(self):
+        self.service_busy = False
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+
+    def close_window(self):
+        self.closing = True
+        self.ui_dispatcher.close()
+        self.root.destroy()
     
     def clear_log(self):
         """清空日志"""

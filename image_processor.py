@@ -1,19 +1,22 @@
 import io
-import os
 import sys
 import random
-import numpy as np
+from pathlib import Path
 import tkinter as tk
 from PIL import Image
 
-# 引入 YOLO 模型类
-from ultralytics import YOLO
+from model_loader import load_yolo_model
+from roi_utils import crop_roi
+from roi_storage import resolve_roi_directory, save_roi_image
 
 # 从 config 中引入常量
 from config import (
     MAX_IMAGE_WIDTH, 
     MAX_IMAGE_HEIGHT, 
     MODEL_PATH, 
+    ROI_BBOX,
+    ROI_SAVE_ENABLED,
+    ROI_SAVE_DIR,
     SHAPE_COLOR_MAP, 
     RANGE_MAPPING
 )
@@ -91,36 +94,51 @@ class ImageProcessor:
         self.logger = logger
         self.current_image = None
         self.photo_image = None
+        self.roi_save_enabled = ROI_SAVE_ENABLED
+        self.roi_save_dir = resolve_roi_directory(ROI_SAVE_DIR)
+        self.last_saved_roi_path = None
         
         # 初始化防堆叠追踪器
         self.tracker = PlacementTracker(logger)
         
         # 步骤 1: 模型加载 (确保 PyInstaller 兼容性)
         self.model = self._load_model()
-        self.logger.log("YOLOv8 模型加载完成。")
+        self.logger.log(f"YOLO 分类模型加载完成：{MODEL_PATH}，类别：{self.model.names}")
+        for name in ("hole", "stain", "scratch", "damage"):
+            self.logger.log(f"货位映射：{name} -> {RANGE_MAPPING[SHAPE_COLOR_MAP[name]]}")
+        self.logger.log(f"推理前启用 ROI 裁剪：{ROI_BBOX}")
+        if self.roi_save_enabled:
+            self.logger.log(f"ROI 图片自动保存目录：{self.roi_save_dir}")
+        else:
+            self.logger.log("ROI 图片自动保存已关闭")
 
     def _load_model(self):
         """处理 PyInstaller 打包后的资源路径，并加载模型。"""
-        model_path = MODEL_PATH
-        
-        if getattr(sys, 'frozen', False):
-            # 运行在 PyInstaller 打包后的环境中
-            base_path = sys._MEIPASS
-            model_path = os.path.join(base_path, MODEL_PATH)
+        base_path = (
+            Path(sys._MEIPASS)
+            if getattr(sys, 'frozen', False)
+            else Path(__file__).resolve().parent
+        )
+        model_path = base_path / MODEL_PATH
         
         try:
             # 检查模型文件是否存在
-            if not os.path.exists(model_path):
-                self.logger.log(f"错误: 模型文件未找到于路径: {model_path}")
-                # 尝试使用相对路径作为后备（仅在非打包环境中可能工作）
-                model_path = MODEL_PATH
+            if not model_path.is_file():
+                raise FileNotFoundError(f"模型文件未找到：{model_path}")
             
             # 加载 YOLO 模型
-            model = YOLO(model_path)
+            model = load_yolo_model(model_path)
+            if model.task != "classify":
+                raise ValueError(f"需要分类模型，当前模型任务为 {model.task}")
+            unknown_classes = set(model.names.values()) - set(SHAPE_COLOR_MAP)
+            if unknown_classes:
+                raise ValueError(f"模型类别未配置放置映射：{sorted(unknown_classes)}")
             return model
         except Exception as e:
             self.logger.log(f"模型加载失败: {e}")
-            raise RuntimeError("YOLO 模型加载失败，请检查 best.pt 文件和 PyInstaller 配置。")
+            raise RuntimeError(
+                f"YOLO 分类模型加载失败，请检查 {MODEL_PATH} 和 PyInstaller 配置。"
+            ) from e
 
     
     def display_image(self, image_data: bytes):
@@ -176,7 +194,7 @@ class ImageProcessor:
     
     def process_image(self, image_data: bytes) -> int:
         """
-        处理接收到的图像，执行缺陷检测，应用防堆叠逻辑，并返回 1-12 的最终结果。
+        解码原图、裁剪 ROI、执行缺陷分类，并返回 1-12 的最终结果。
 
         Args:
             image_data: 接收到的图像二进制数据。
@@ -184,42 +202,45 @@ class ImageProcessor:
         Returns:
             发送给 PLC 的最终结果编号 (1-12)。
         """
+        self.last_saved_roi_path = None
         try:
             self.logger.log("开始图像分析处理...")
             
             # 步骤 1: 将二进制图像数据转换为 PIL 图像
-            image = Image.open(io.BytesIO(image_data)).convert('RGB')
-            
-            # 步骤 2: 执行 YOLOv8 推理
-            # results 对象包含检测到的所有目标
-            results = self.model(image, verbose=False)
-            
-            # 初始化最高置信度的类别信息
-            max_prob_name = None
-            max_prob_value = 0.0
-            
-            # 步骤 3: 提取最高置信度的缺陷类别 (假设只关注单个最主要的缺陷)
-            if results and results[0].boxes:
-                # 遍历检测到的所有框
-                for box in results[0].boxes:
-                    conf = box.conf.cpu().numpy()[0]
-                    cls_id = int(box.cls.cpu().numpy()[0])
-                    
-                    if conf > max_prob_value:
-                        max_prob_value = conf
-                        # 获取类别名称
-                        max_prob_name = self.model.names[cls_id]
+            with Image.open(io.BytesIO(image_data)) as source_image:
+                image = source_image.convert('RGB')
 
-            if not max_prob_name:
-                self.logger.log("模型未检测到有效缺陷 (置信度低于阈值或无目标)。")
-                # 如果未检测到缺陷，默认为 'Gap' (缺口)，对应结果 1-3
-                max_prob_name = 'Gap' 
-            
-            self.logger.log(f"检测到的主要缺陷: {max_prob_name}, 置信度: {max_prob_value:.2f}")
+            roi_image = crop_roi(image)
+            self.logger.log(f"ROI 裁剪完成：{image.size} -> {roi_image.size}")
+
+            # 保存的就是接下来交给模型的 ROI，识别失败的样本也保留。
+            if self.roi_save_enabled:
+                try:
+                    self.last_saved_roi_path = save_roi_image(
+                        roi_image, self.roi_save_dir, ROI_BBOX
+                    )
+                    self.logger.log(f"ROI 图片已保存：{self.last_saved_roi_path}")
+                except Exception as save_error:
+                    self.logger.log(f"警告：ROI 图片保存失败，继续识别：{save_error}")
+
+            # 步骤 2: 裁剪图直接在内存中送入分类模型；输入尺寸沿用权重配置。
+            results = self.model(roi_image, verbose=False)
+
+            # 步骤 3: 分类模型返回 probs，不返回检测框 boxes。
+            if not results or results[0].probs is None:
+                raise RuntimeError("模型没有返回分类概率")
+            probs = results[0].probs
+            cls_id = int(probs.top1)
+            max_prob_name = self.model.names[cls_id]
+            max_prob_value = float(probs.top1conf.item())
+            if max_prob_name not in SHAPE_COLOR_MAP:
+                raise RuntimeError(f"未配置的模型类别：{max_prob_name}")
+
+            self.logger.log(f"识别到的缺陷: {max_prob_name}, 置信度: {max_prob_value:.2f}")
 
             # 步骤 4: 映射到 1-4 主类别编号 (PLC 逻辑分类)
             # 使用 config.SHAPE_COLOR_MAP
-            main_category_index = SHAPE_COLOR_MAP.get(max_prob_name, 4) # 默认使用 4 (Gap/缺口)
+            main_category_index = SHAPE_COLOR_MAP[max_prob_name]
             
             # 步骤 5: 应用防堆叠追踪器逻辑，生成最终的 1-12 结果
             final_result = self.tracker.check_placement(main_category_index)
@@ -230,5 +251,5 @@ class ImageProcessor:
             
         except Exception as e:
             self.logger.log(f"图像处理过程中发生错误: {str(e)}")
-            # 如果出现严重异常，返回默认的安全结果 6
-            return 6
+            # 交由 TCP 层返回既有错误码，避免识别失败时发送有效货位编号。
+            raise

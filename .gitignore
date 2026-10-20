@@ -21,3 +21,6 @@ Thumbs.db
 # 日志
 *.log
 logs/
+
+# 在线采集的 ROI 图片
+roi_images/
